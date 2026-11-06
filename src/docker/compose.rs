@@ -236,6 +236,16 @@ fn write_generated_files(ctx: &WorkspaceContext) -> Result<PathBuf> {
         .with_context(|| format!("Failed to create .igniter directory at {:?}", dir))?;
 
     for provider in crate::services::BUILTIN_SERVICES {
+        if ctx.config.workspace.is_partial()
+            && !ctx
+                .config
+                .workspace
+                .services_local
+                .iter()
+                .any(|s| s == provider.name())
+        {
+            continue;
+        }
         provider.write_auxiliary_files(ctx, &dir)?;
     }
 
@@ -253,10 +263,30 @@ pub fn build_compose(ctx: &WorkspaceContext) -> Value {
     let mut volumes = Map::new();
 
     for provider in crate::services::BUILTIN_SERVICES {
+        if ctx.config.workspace.is_partial()
+            && !ctx
+                .config
+                .workspace
+                .services_local
+                .iter()
+                .any(|s| s == provider.name())
+        {
+            continue;
+        }
         provider.contribute_compose(ctx, &mut services, &mut volumes);
     }
 
     for (name, custom) in &services_cfg.custom {
+        if ctx.config.workspace.is_partial()
+            && !ctx
+                .config
+                .workspace
+                .services_local
+                .iter()
+                .any(|s| s == name)
+        {
+            continue;
+        }
         let mut service = json!({ "image": custom.image });
         if let (Some(host_port), Some(target)) =
             (ctx.port_allocations.get(name), custom.target_port)
@@ -420,5 +450,41 @@ neon_proxy = true
         assert_eq!(parse_ps_output(ndjson).len(), 2);
         assert_eq!(parse_ps_output("[{\"Service\":\"a\"}]").len(), 1);
         assert!(parse_ps_output("").is_empty());
+    }
+
+    #[test]
+    fn partial_mode_filters_compose_services() {
+        let mut ctx = test_ctx(CONFIG, Some(4000));
+        ctx.config.workspace.mode = crate::config::WorkspaceMode::Partial;
+        ctx.config.workspace.services_local = vec!["postgres".to_string()];
+        let compose = build_compose(&ctx);
+        let names: Vec<&String> = compose["services"].as_object().unwrap().keys().collect();
+        assert!(names.contains(&&"postgres".to_string()));
+        assert!(!names.contains(&&"garage".to_string()));
+        assert!(!names.contains(&&"mail".to_string()));
+    }
+
+    #[test]
+    fn partial_mode_empty_locals_produces_no_services() {
+        let mut ctx = test_ctx(CONFIG, Some(4000));
+        ctx.config.workspace.mode = crate::config::WorkspaceMode::Partial;
+        ctx.config.workspace.services_local = vec![];
+        let compose = build_compose(&ctx);
+        assert!(
+            compose["services"].as_object().unwrap().is_empty(),
+            "empty services_local should produce zero compose services"
+        );
+    }
+
+    #[test]
+    fn partial_mode_custom_service_included_when_local() {
+        let mut ctx = test_ctx(CONFIG, Some(4000));
+        ctx.config.workspace.mode = crate::config::WorkspaceMode::Partial;
+        ctx.config.workspace.services_local = vec!["mail".to_string()];
+        let compose = build_compose(&ctx);
+        let names: Vec<&String> = compose["services"].as_object().unwrap().keys().collect();
+        assert!(names.contains(&&"mail".to_string()));
+        assert!(!names.contains(&&"postgres".to_string()));
+        assert!(!names.contains(&&"garage".to_string()));
     }
 }

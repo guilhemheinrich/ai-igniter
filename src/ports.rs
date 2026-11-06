@@ -104,15 +104,22 @@ where
     let mut ports = BTreeMap::from([("base".to_string(), base_port)]);
     let mut allocated = vec![base_port];
     let mut warnings = Vec::new();
+    let locals = &config.workspace.services_local;
+    let is_partial = config.workspace.is_partial();
 
     for (name, offset) in config.port_offsets() {
+        // Partial workspaces only own ports for the services they run locally
+        if is_partial && !crate::context::is_local_port_key(&name, locals) {
+            continue;
+        }
         let candidate = base_port.checked_add(offset);
         let port = match candidate {
             Some(cand) if !allocated.contains(&cand) && check(cand) => cand,
             Some(cand) => {
-                let fallback = find_available_port(cand + 1, &allocated, &check).with_context(|| {
-                    format!("Failed to find an available port for service '{name}'")
-                })?;
+                let fallback =
+                    find_available_port(cand + 1, &allocated, &check).with_context(|| {
+                        format!("Failed to find an available port for service '{name}'")
+                    })?;
                 warnings.push(format!(
                     "Port {cand} for service '{name}' is in use; dynamically allocated port {fallback}."
                 ));
@@ -137,7 +144,10 @@ where
 }
 
 /// Allocates ports for the base application and all configured services using real TCP checks.
-pub fn allocate_ports(config: &Config, base_port: u16) -> Result<(BTreeMap<String, u16>, Vec<String>)> {
+pub fn allocate_ports(
+    config: &Config,
+    base_port: u16,
+) -> Result<(BTreeMap<String, u16>, Vec<String>)> {
     allocate_ports_with_checker(config, base_port, is_port_available)
 }
 
@@ -196,6 +206,7 @@ mod tests {
             env_file: ".env".into(),
             copy_files: vec![],
             services: Default::default(),
+            workspace: Default::default(),
             env_template: Default::default(),
         };
 
@@ -213,15 +224,13 @@ mod tests {
         );
 
         // Scenario 1: Port 4001 is free
-        let (ports, warnings) =
-            allocate_ports_with_checker(&config, 4000, |_| true).unwrap();
+        let (ports, warnings) = allocate_ports_with_checker(&config, 4000, |_| true).unwrap();
         assert_eq!(ports.get("base"), Some(&4000));
         assert_eq!(ports.get("mail"), Some(&4001));
         assert!(warnings.is_empty());
 
         // Scenario 2: Port 4001 is squatted!
-        let (ports, warnings) =
-            allocate_ports_with_checker(&config, 4000, |p| p != 4001).unwrap();
+        let (ports, warnings) = allocate_ports_with_checker(&config, 4000, |p| p != 4001).unwrap();
         assert_eq!(ports.get("base"), Some(&4000));
         assert_eq!(ports.get("mail"), Some(&4002));
         assert_eq!(warnings.len(), 1);

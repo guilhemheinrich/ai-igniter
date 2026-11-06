@@ -38,13 +38,13 @@ fn run(cli: Cli) -> Result<()> {
     // Check for updates asynchronously without blocking command execution
     let _update_guard = commands::spawn_background_update_checker();
 
-    let ctx = WorkspaceContext::resolve(&cli).context("Failed to resolve workspace context")?;
+    let mut ctx = WorkspaceContext::resolve(&cli).context("Failed to resolve workspace context")?;
     ctx.print_warnings();
 
     match &cli.command {
         Commands::Init(_) | Commands::Update(_) => unreachable!(),
         Commands::Bootstrap => commands::execute_bootstrap(&ctx),
-        Commands::Dev(args) => commands::execute_dev(&ctx, args),
+        Commands::Dev(args) => commands::execute_dev(&mut ctx, args),
         Commands::Teardown => commands::execute_teardown(&ctx),
         Commands::Status => commands::execute_status(&ctx),
         Commands::Env(args) => commands::execute_env(&ctx, args),

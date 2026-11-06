@@ -47,11 +47,14 @@ impl Supervisor {
     /// Blocks until a shutdown signal or the dev command finishes, or fails if a service stops on its own.
     pub fn run_dev(
         ctx: &WorkspaceContext,
-        compose: &DockerCompose<'_>,
+        compose: Option<&DockerCompose<'_>>,
         shutdown: &ShutdownSignal,
         dev_command: Option<&str>,
     ) -> Result<()> {
-        let expected = compose.running_services()?;
+        let expected = match compose {
+            Some(c) => c.running_services()?,
+            None => std::collections::BTreeSet::new(),
+        };
 
         safe_println!();
         safe_println!(
@@ -138,15 +141,18 @@ impl Supervisor {
             }
             last_check = Instant::now();
             // A transient `docker compose ps` failure is not a service failure
-            let Ok(running) = compose.running_services() else {
-                continue;
-            };
-            let stopped: Vec<&str> = expected.difference(&running).map(String::as_str).collect();
-            if !stopped.is_empty() && !shutdown.requested() {
-                if let Some(ref mut c) = child {
-                    let _ = c.kill();
+            if let Some(compose) = compose {
+                let Ok(running) = compose.running_services() else {
+                    continue;
+                };
+                let stopped: Vec<&str> =
+                    expected.difference(&running).map(String::as_str).collect();
+                if !stopped.is_empty() && !shutdown.requested() {
+                    if let Some(ref mut c) = child {
+                        let _ = c.kill();
+                    }
+                    bail!("Service(s) stopped unexpectedly: {}", stopped.join(", "));
                 }
-                bail!("Service(s) stopped unexpectedly: {}", stopped.join(", "));
             }
         }
 

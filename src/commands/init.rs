@@ -51,7 +51,6 @@ pub fn execute_init(args: InitArgs) -> Result<()> {
         );
     }
 
-
     let mut env_template = BTreeMap::new();
     let mut services = ServicesConfig::default();
 
@@ -126,6 +125,7 @@ pub fn execute_init(args: InitArgs) -> Result<()> {
         env_file,
         copy_files: vec![],
         services,
+        workspace: Default::default(),
         env_template,
     };
     config.validate()?;

@@ -1,4 +1,4 @@
-use crate::context::WorkspaceContext;
+use crate::context::{WorkspaceContext, check_pid_alive, read_state};
 use crate::docker::DockerCompose;
 use anyhow::Result;
 use colored::Colorize;
@@ -70,6 +70,55 @@ pub fn execute_status(ctx: &WorkspaceContext) -> Result<()> {
                 "Could not inspect Docker containers".red(),
                 e
             );
+        }
+    }
+
+    // Inherited services section for partial workspaces
+    if ctx.config.workspace.is_partial() {
+        println!();
+        if ctx.config.workspace.services_local.is_empty() {
+            println!(
+                "  Local services: {}",
+                "(none — only dev_command runs locally)".dimmed()
+            );
+        }
+        println!("  Inherited services:");
+        if let Some(parent_path) = &ctx.parent_path {
+            match read_state(parent_path) {
+                Ok(parent_state) => {
+                    let parent_alive = check_pid_alive(parent_state.pid);
+                    let inherited: Vec<_> = parent_state
+                        .services
+                        .iter()
+                        .filter(|(name, _)| !ctx.config.workspace.services_local.contains(name))
+                        .collect();
+                    if inherited.is_empty() {
+                        println!("    (no inherited services)");
+                    } else {
+                        for (name, svc) in inherited {
+                            let port_info = parent_state
+                                .port_allocations
+                                .get(name)
+                                .map(|p| format!(":{p}"))
+                                .unwrap_or_default();
+                            let status = if parent_alive && svc.status == "running" {
+                                "running (via parent)".green()
+                            } else {
+                                "unknown (parent not responding)".yellow()
+                            };
+                            println!("    - {:<16}{} [{}]", name.bold(), port_info.cyan(), status);
+                        }
+                    }
+                }
+                Err(_) => {
+                    println!(
+                        "    {}",
+                        "Could not read parent state (parent not running?)".yellow()
+                    );
+                }
+            }
+        } else {
+            println!("    {}", "Parent path not resolved".yellow());
         }
     }
 

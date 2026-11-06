@@ -74,9 +74,17 @@ pub trait ServiceProvider: Sync {
 pub static BUILTIN_SERVICES: &[&'static dyn ServiceProvider] =
     &[&garage::GarageProvider, &postgres::PostgresProvider];
 
-pub fn get_active_services(ctx: &WorkspaceContext) -> Vec<Box<dyn Service + '_>> {
+pub fn get_active_services<'a>(
+    ctx: &'a WorkspaceContext,
+    filter: Option<&[String]>,
+) -> Vec<Box<dyn Service + 'a>> {
     let mut active = Vec::new();
     for provider in BUILTIN_SERVICES {
+        if let Some(names) = filter
+            && !names.iter().any(|n| n == provider.name())
+        {
+            continue;
+        }
         if let Some(service) = provider.get_active_service(ctx) {
             active.push(service);
         }

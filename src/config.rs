@@ -10,6 +10,35 @@ pub use crate::services::garage::GarageConfig;
 pub use crate::services::postgres::NeonProxyConfig;
 pub use crate::services::postgres::PostgresConfig;
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkspaceMode {
+    #[default]
+    Full,
+    Partial,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    #[serde(default)]
+    pub mode: WorkspaceMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_from: Option<String>,
+    #[serde(default)]
+    pub services_local: Vec<String>,
+}
+
+impl WorkspaceConfig {
+    pub fn is_partial(&self) -> bool {
+        self.mode == WorkspaceMode::Partial
+    }
+
+    /// True when the section is absent or left at its defaults, so it is not written back to TOML.
+    pub fn is_unset(&self) -> bool {
+        !self.is_partial() && self.inherit_from.is_none() && self.services_local.is_empty()
+    }
+}
+
 pub const CONFIG_FILE_NAME: &str = "ai-igniter.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +64,9 @@ pub struct Config {
 
     #[serde(default)]
     pub services: ServicesConfig,
+
+    #[serde(default, skip_serializing_if = "WorkspaceConfig::is_unset")]
+    pub workspace: WorkspaceConfig,
 
     #[serde(default)]
     pub env_template: BTreeMap<String, String>,
@@ -227,6 +259,17 @@ impl Config {
         )
     }
 
+    pub fn known_service_names(&self) -> HashSet<&str> {
+        let mut names = HashSet::new();
+        for provider in BUILTIN_SERVICES {
+            names.insert(provider.name());
+        }
+        for name in self.services.custom.keys() {
+            names.insert(name.as_str());
+        }
+        names
+    }
+
     /// Host port offsets of enabled services, keyed by allocation name.
     pub fn port_offsets(&self) -> Vec<(String, u16)> {
         let mut offsets = Vec::new();
@@ -275,6 +318,24 @@ impl Config {
                 bail!(
                     "Custom service '{name}': `port_offset` and `target_port` must be set together"
                 );
+            }
+        }
+
+        if self.workspace.is_partial() {
+            if self.workspace.inherit_from.is_none() {
+                bail!("partial mode requires `inherit_from` to be set in [workspace]");
+            }
+            if self.compose_file.is_some() {
+                bail!("partial mode cannot be used with an external compose_file");
+            }
+            let known_services = self.known_service_names();
+            for name in &self.workspace.services_local {
+                if !known_services.contains(name.as_str()) {
+                    bail!(
+                        "services_local entry '{name}' is not a known service (available: {})",
+                        known_services.into_iter().collect::<Vec<_>>().join(", ")
+                    );
+                }
             }
         }
 
@@ -620,5 +681,96 @@ VAR_C = "3"
             merged.env_template.get("VAR_C").map(|s| s.as_str()),
             Some("3")
         );
+    }
+
+    #[test]
+    fn parses_default_workspace_config() {
+        let config = parse("name = \"app\"");
+        assert_eq!(config.workspace.mode, WorkspaceMode::Full);
+        assert!(config.workspace.inherit_from.is_none());
+        assert!(config.workspace.services_local.is_empty());
+        assert!(!config.workspace.is_partial());
+    }
+
+    #[test]
+    fn parses_partial_workspace_config() {
+        let config = parse(
+            r#"
+name = "app"
+[services.postgres]
+database = "app"
+user = "app"
+password = "p"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+services_local = ["postgres"]
+"#,
+        );
+        assert_eq!(config.workspace.mode, WorkspaceMode::Partial);
+        assert_eq!(config.workspace.inherit_from.as_deref(), Some("root"));
+        assert_eq!(config.workspace.services_local, vec!["postgres"]);
+        assert!(config.workspace.is_partial());
+    }
+
+    #[test]
+    fn rejects_partial_without_inherit_from() {
+        let config = parse(
+            r#"
+name = "app"
+[workspace]
+mode = "partial"
+"#,
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("inherit_from"), "{err}");
+    }
+
+    #[test]
+    fn rejects_partial_with_compose_file() {
+        let config = parse(
+            r#"
+name = "app"
+compose_file = "docker-compose.yml"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+"#,
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("compose_file"), "{err}");
+    }
+
+    #[test]
+    fn rejects_unknown_services_local() {
+        let config = parse(
+            r#"
+name = "app"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+services_local = ["nonexistent"]
+"#,
+        );
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("nonexistent"), "{err}");
+    }
+
+    #[test]
+    fn accepts_valid_partial_config() {
+        let config = parse(
+            r#"
+name = "app"
+[services.postgres]
+database = "app"
+user = "app"
+password = "p"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+services_local = ["postgres"]
+"#,
+        );
+        config.validate().unwrap();
     }
 }

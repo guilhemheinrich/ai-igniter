@@ -1,7 +1,8 @@
 use crate::cli::Cli;
 use crate::config::{CONFIG_FILE_NAME, Config, sanitize_name};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use colored::Colorize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ pub struct WorkspaceContext {
     pub config_path: PathBuf,
     pub config: Config,
     pub port_allocations: BTreeMap<String, u16>,
+    pub parent_path: Option<PathBuf>,
+    pub parent_template_vars: Option<BTreeMap<String, String>>,
     pub warnings: Vec<String>,
 }
 
@@ -123,6 +126,22 @@ impl WorkspaceContext {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "workspace".to_string());
         let compose_project = format!("{}-{}-{}", sanitize_name(&config.name), slug, hash);
+        let compose_project = if config.workspace.is_partial() {
+            format!("{compose_project}-partial")
+        } else {
+            compose_project
+        };
+
+        let parent_path = if config.workspace.is_partial() {
+            let inherit_from = config
+                .workspace
+                .inherit_from
+                .as_deref()
+                .expect("validate() ensures inherit_from is Some in partial mode");
+            Some(resolve_parent_path(inherit_from, &workspace_path)?)
+        } else {
+            None
+        };
 
         let base_port = match base_port {
             Some(p) => p,
@@ -147,12 +166,19 @@ impl WorkspaceContext {
             config_path,
             config,
             port_allocations,
+            parent_path,
+            parent_template_vars: None,
             warnings,
         })
     }
 
     pub fn template_vars(&self) -> BTreeMap<String, String> {
         let mut vars = BTreeMap::new();
+
+        // Inherited vars go first so local vars win on collision
+        if let Some(parent_vars) = &self.parent_template_vars {
+            vars.extend(parent_vars.clone());
+        }
 
         vars.insert("project.name".into(), self.config.name.clone());
         vars.insert("workspace.slug".into(), self.slug.clone());
@@ -185,6 +211,36 @@ impl WorkspaceContext {
         }
 
         vars
+    }
+
+    /// Merges inherited ports and template vars from the parent state into this context.
+    /// Called by `execute_dev` after reading parent state — never during resolve.
+    pub fn merge_inherited_state(&mut self, parent: &WorkspaceState) {
+        let locals = &self.config.workspace.services_local;
+
+        for (key, port) in &parent.port_allocations {
+            if key == "base" {
+                continue;
+            }
+            if is_local_port_key(key, locals) {
+                continue;
+            }
+            self.port_allocations.insert(key.clone(), *port);
+        }
+
+        // Filter parent template_vars: keep only those for inherited services
+        let mut inherited_vars = BTreeMap::new();
+        for (key, val) in &parent.template_vars {
+            // Skip vars whose service is local (the local provider handles those)
+            let is_local = locals.iter().any(|svc| {
+                key.starts_with(&format!("services.{svc}."))
+                    || key.starts_with(&format!("services.{svc}_"))
+            });
+            if !is_local {
+                inherited_vars.insert(key.clone(), val.clone());
+            }
+        }
+        self.parent_template_vars = Some(inherited_vars);
     }
 
     pub fn interpolate(&self, text: &str) -> Result<String> {
@@ -288,6 +344,192 @@ pub(crate) fn url_encode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Workspace state file — written by `dev`, read by partial workspaces
+// ---------------------------------------------------------------------------
+
+const STATE_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceState {
+    pub version: u32,
+    pub pid: u32,
+    pub started_at: String,
+    pub workspace_path: PathBuf,
+    pub compose_project: String,
+    pub base_port: u16,
+    pub port_allocations: BTreeMap<String, u16>,
+    pub template_vars: BTreeMap<String, String>,
+    pub services: BTreeMap<String, ServiceState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceState {
+    pub status: String,
+    pub image: String,
+}
+
+pub fn state_file_path(workspace_path: &Path) -> PathBuf {
+    workspace_path.join(".igniter").join("state.json")
+}
+
+pub fn write_state(workspace_path: &Path, state: &WorkspaceState) -> Result<()> {
+    let dir = workspace_path.join(".igniter");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create .igniter directory at {:?}", dir))?;
+
+    let path = state_file_path(workspace_path);
+    let content =
+        serde_json::to_string_pretty(state).context("Failed to serialize workspace state")?;
+
+    let tmp_path = path.with_extension("json.tmp");
+    std::fs::write(&tmp_path, &content)
+        .with_context(|| format!("Failed to write temp state file {:?}", tmp_path))?;
+
+    // On Windows, fs::rename does not replace an existing file — remove first.
+    #[cfg(windows)]
+    {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    std::fs::rename(&tmp_path, &path)
+        .with_context(|| format!("Failed to rename state file {:?}", path))?;
+    Ok(())
+}
+
+pub fn read_state(workspace_path: &Path) -> Result<WorkspaceState> {
+    let path = state_file_path(workspace_path);
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read state file {:?}", path))?;
+    let state: WorkspaceState = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse state file {:?}", path))?;
+    if state.version > STATE_VERSION {
+        bail!(
+            "State file version {} is newer than supported version {}. Update ai-igniter.",
+            state.version,
+            STATE_VERSION
+        );
+    }
+    Ok(state)
+}
+
+pub fn build_workspace_state(ctx: &WorkspaceContext) -> WorkspaceState {
+    let services = ctx
+        .service_images()
+        .into_iter()
+        .map(|(name, image)| {
+            (
+                name,
+                ServiceState {
+                    status: "running".to_string(),
+                    image,
+                },
+            )
+        })
+        .collect();
+
+    WorkspaceState {
+        version: STATE_VERSION,
+        pid: std::process::id(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        workspace_path: ctx.workspace_path.clone(),
+        compose_project: ctx.compose_project.clone(),
+        base_port: ctx.base_port,
+        port_allocations: ctx.port_allocations.clone(),
+        template_vars: ctx.template_vars(),
+        services,
+    }
+}
+
+#[cfg(unix)]
+pub fn check_pid_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 checks process existence without delivering a signal.
+    let ret = unsafe {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        kill(pid as i32, 0)
+    };
+    if ret == 0 {
+        return true;
+    }
+    // EPERM means the process exists but belongs to another user — still alive.
+    std::io::Error::last_os_error().raw_os_error() == Some(1) // EPERM
+}
+
+#[cfg(windows)]
+pub fn check_pid_alive(_pid: u32) -> bool {
+    // Best-effort on Windows: assume alive and warn the caller.
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Parent resolution for partial mode
+// ---------------------------------------------------------------------------
+
+pub fn resolve_parent_path(inherit_from: &str, workspace_path: &Path) -> Result<PathBuf> {
+    let parent = if inherit_from == "root" {
+        git_main_checkout(workspace_path).with_context(
+            || "inherit_from = \"root\" requires a git repository with a main checkout",
+        )?
+    } else {
+        let path = PathBuf::from(inherit_from);
+        if path.is_absolute() {
+            if !path.join(CONFIG_FILE_NAME).exists()
+                && !path.join(format!(".{CONFIG_FILE_NAME}")).exists()
+            {
+                bail!(
+                    "inherit_from path {:?} does not contain an ai-igniter config",
+                    path
+                );
+            }
+            path
+        } else {
+            resolve_worktree_by_name(inherit_from, workspace_path)?
+        }
+    };
+
+    let parent = std::fs::canonicalize(&parent).unwrap_or(parent);
+    let ws = std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
+    if parent == ws {
+        bail!(
+            "partial workspace cannot inherit from itself\n\
+             Hint: use a worktree (`git worktree add`) and configure partial mode there"
+        );
+    }
+    Ok(parent)
+}
+
+fn resolve_worktree_by_name(name: &str, workspace_path: &Path) -> Result<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("Failed to run `git worktree list`")?;
+    if !output.status.success() {
+        bail!("`git worktree list` failed");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some(path_str) = line.strip_prefix("worktree ") {
+            let path = PathBuf::from(path_str);
+            if path.file_name().and_then(|n| n.to_str()) == Some(name) {
+                return Ok(path);
+            }
+        }
+    }
+    bail!("No git worktree named '{name}' found (check `git worktree list`)")
+}
+
+/// Returns true when `key` belongs to a service listed in `services_local` — including
+/// companion keys like `postgres_neon` for service `postgres` (prefix match: `{svc}_`).
+pub(crate) fn is_local_port_key(key: &str, services_local: &[String]) -> bool {
+    services_local
+        .iter()
+        .any(|svc| key == svc || key.starts_with(&format!("{svc}_")))
 }
 
 fn resolve_root_path(
@@ -564,5 +806,209 @@ base_port = 4500
         let explicit = Path::new("/tmp/explicit-root");
         let root_cli = resolve_root_path(Some(explicit), Some(main), ws);
         assert_eq!(root_cli, explicit);
+    }
+
+    #[test]
+    fn workspace_state_serde_roundtrip() {
+        let state = WorkspaceState {
+            version: 1,
+            pid: 12345,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace_path: PathBuf::from("/work/main"),
+            compose_project: "my-app-main-abcd".to_string(),
+            base_port: 4000,
+            port_allocations: BTreeMap::from([
+                ("base".to_string(), 4000u16),
+                ("postgres".to_string(), 4001),
+            ]),
+            template_vars: BTreeMap::from([(
+                "services.postgres.url".to_string(),
+                "postgresql://u:p@127.0.0.1:4001/db".to_string(),
+            )]),
+            services: BTreeMap::from([(
+                "postgres".to_string(),
+                ServiceState {
+                    status: "running".to_string(),
+                    image: "postgres:17".to_string(),
+                },
+            )]),
+        };
+        let json = serde_json::to_string(&state).unwrap();
+        let parsed: WorkspaceState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.pid, 12345);
+        assert_eq!(parsed.port_allocations["postgres"], 4001);
+        assert_eq!(
+            parsed.template_vars["services.postgres.url"],
+            "postgresql://u:p@127.0.0.1:4001/db"
+        );
+        assert_eq!(parsed.services["postgres"].status, "running");
+        assert_eq!(parsed.services["postgres"].image, "postgres:17");
+    }
+
+    #[test]
+    fn workspace_state_write_read_roundtrip() {
+        let dir = std::env::temp_dir().join("igniter-test-state-roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let state = WorkspaceState {
+            version: 1,
+            pid: 99,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace_path: dir.clone(),
+            compose_project: "test-proj".to_string(),
+            base_port: 5000,
+            port_allocations: BTreeMap::from([("base".to_string(), 5000u16)]),
+            template_vars: BTreeMap::from([("key".to_string(), "val".to_string())]),
+            services: BTreeMap::new(),
+        };
+        write_state(&dir, &state).unwrap();
+        let loaded = read_state(&dir).unwrap();
+        assert_eq!(loaded.pid, 99);
+        assert_eq!(loaded.base_port, 5000);
+        assert_eq!(loaded.template_vars["key"], "val");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_local_port_key_exact_and_prefix() {
+        let locals = vec!["postgres".to_string()];
+        assert!(is_local_port_key("postgres", &locals));
+        assert!(is_local_port_key("postgres_neon", &locals));
+        assert!(!is_local_port_key("garage", &locals));
+        assert!(!is_local_port_key("garage_web", &locals));
+    }
+
+    #[test]
+    fn is_local_port_key_empty_locals() {
+        let locals: Vec<String> = vec![];
+        assert!(!is_local_port_key("postgres", &locals));
+        assert!(!is_local_port_key("base", &locals));
+    }
+
+    #[test]
+    fn is_local_port_key_multiple_locals() {
+        let locals = vec!["postgres".to_string(), "garage".to_string()];
+        assert!(is_local_port_key("postgres", &locals));
+        assert!(is_local_port_key("postgres_neon", &locals));
+        assert!(is_local_port_key("garage", &locals));
+        assert!(is_local_port_key("garage_web", &locals));
+        assert!(!is_local_port_key("mail", &locals));
+    }
+
+    #[test]
+    fn allocate_ports_partial_filters_non_local() {
+        let toml_str = r#"
+name = "app"
+env_file = ".env"
+copy_files = []
+[services.postgres]
+database = "app"
+user = "app"
+password = "p"
+[services.garage]
+access_key = "k"
+secret_key = "s"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+services_local = ["postgres"]
+"#;
+        let config: crate::config::Config = toml::from_str(toml_str).unwrap();
+        let (ports, _) = crate::ports::allocate_ports(&config, 4000).unwrap();
+        assert!(ports.contains_key("base"));
+        assert!(ports.contains_key("postgres"));
+        assert!(
+            !ports.contains_key("garage"),
+            "garage should be filtered out"
+        );
+        assert!(
+            !ports.contains_key("garage_web"),
+            "garage_web should be filtered out"
+        );
+    }
+
+    #[test]
+    fn allocate_ports_partial_empty_locals_only_base() {
+        let toml_str = r#"
+name = "app"
+env_file = ".env"
+copy_files = []
+[services.postgres]
+database = "app"
+user = "app"
+password = "p"
+[workspace]
+mode = "partial"
+inherit_from = "root"
+services_local = []
+"#;
+        let config: crate::config::Config = toml::from_str(toml_str).unwrap();
+        let (ports, _) = crate::ports::allocate_ports(&config, 4000).unwrap();
+        assert_eq!(ports.len(), 1);
+        assert_eq!(ports["base"], 4000);
+    }
+
+    #[test]
+    fn merge_inherited_state_strips_base_and_locals() {
+        let mut ctx = test_ctx(
+            r#"
+name = "app"
+[services.postgres]
+database = "app"
+user = "app"
+password = "p"
+[services.garage]
+access_key = "k"
+secret_key = "s"
+"#,
+            Some(4000),
+        );
+        ctx.config.workspace.services_local = vec!["postgres".to_string()];
+
+        let parent_state = WorkspaceState {
+            version: 1,
+            pid: 1000,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            workspace_path: PathBuf::from("/work/main"),
+            compose_project: "app-main-abcd".to_string(),
+            base_port: 5000,
+            port_allocations: BTreeMap::from([
+                ("base".to_string(), 5000u16),
+                ("postgres".to_string(), 5001),
+                ("postgres_neon".to_string(), 5002),
+                ("garage".to_string(), 5003),
+                ("garage_web".to_string(), 5004),
+            ]),
+            template_vars: BTreeMap::from([
+                (
+                    "services.postgres.url".to_string(),
+                    "parent-pg-url".to_string(),
+                ),
+                ("services.garage.web_port".to_string(), "5004".to_string()),
+                ("project.name".to_string(), "app".to_string()),
+            ]),
+            services: BTreeMap::new(),
+        };
+
+        ctx.merge_inherited_state(&parent_state);
+
+        // base never inherited
+        assert_eq!(ctx.port_allocations["base"], 4000);
+        // postgres keeps local allocation (not overwritten by parent 5001)
+        assert_eq!(ctx.port_allocations["postgres"], 4001);
+        // garage + garage_web come from parent
+        assert_eq!(ctx.port_allocations["garage"], 5003);
+        assert_eq!(ctx.port_allocations["garage_web"], 5004);
+
+        let vars = ctx.parent_template_vars.as_ref().unwrap();
+        // postgres vars filtered (local service)
+        assert!(!vars.contains_key("services.postgres.url"));
+        // garage vars inherited
+        assert_eq!(vars["services.garage.web_port"], "5004");
+        // non-service vars inherited
+        assert_eq!(vars["project.name"], "app");
     }
 }
